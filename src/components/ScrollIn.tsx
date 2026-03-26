@@ -26,8 +26,6 @@ import {
   type SplDustToken,
   type BatchBridgeResult,
 } from '@/lib/solana/bridge'
-import { DUST_AGGREGATOR_CONTRACT } from '@/config/env'
-
 import {
   WALLETCONNECT_PROJECT_ID,
   WALLETCONNECT_ENABLED,
@@ -36,6 +34,7 @@ import {
   APP_LOGO_URL,
   DUST_AGGREGATOR_CONTRACT,
 } from '@/config/env'
+import { getTokenPrices } from '@/lib/prices'
 
 import { validateBatch, buildTransactionSummary } from '@/lib/validation'
 import { createStellarContract, StellarContract } from '@/lib/stellar/contract'
@@ -415,7 +414,7 @@ const useDustAggregator = (
 
 // ─── CardSection ──────────────────────────────────────────────────────────────
 
-const CardSection: React.FC<{
+interface CardSectionProps {
   token: string
   tokenShort: string
   price: number
@@ -423,7 +422,9 @@ const CardSection: React.FC<{
   onSelectionChange: (selected: boolean) => void
   belowThreshold: boolean
   minThreshold: number
-}> = ({ token, tokenShort, price, isSelected, onSelectionChange, belowThreshold, minThreshold }) => (
+}
+
+const CardSection = ({ token, tokenShort, price, isSelected, onSelectionChange, belowThreshold, minThreshold }: CardSectionProps) => (
   <Card className={`p-2 mb-2 transition-opacity duration-200 ${belowThreshold ? 'opacity-40 grayscale' : 'opacity-100'}`}>
     <CardHeader>
       <CardTitle className="flex items-center gap-2">
@@ -463,10 +464,12 @@ const CardSection: React.FC<{
 
 // ─── ThresholdSettings ────────────────────────────────────────────────────────
 
-const ThresholdSettings: React.FC<{
+interface ThresholdSettingsProps {
   minThreshold: number
   onThresholdChange: (value: number) => void
-}> = ({ minThreshold, onThresholdChange }) => {
+}
+
+const ThresholdSettings = ({ minThreshold, onThresholdChange }: ThresholdSettingsProps) => {
   const [open, setOpen] = useState(false)
   const [inputValue, setInputValue] = useState(String(minThreshold))
 
@@ -500,7 +503,13 @@ const ThresholdSettings: React.FC<{
 
 // ─── EligibilityBanner ────────────────────────────────────────────────────────
 
-const EligibilityBanner: React.FC<{ eligible: number; total: number; minThreshold: number }> = ({ eligible, total, minThreshold }) => {
+interface EligibilityBannerProps {
+  eligible: number
+  total: number
+  minThreshold: number
+}
+
+const EligibilityBanner = ({ eligible, total, minThreshold }: EligibilityBannerProps) => {
   if (total === 0) return null
   const allEligible = eligible === total
   const noneEligible = eligible === 0
@@ -519,6 +528,10 @@ const EligibilityBanner: React.FC<{ eligible: number; total: number; minThreshol
 
 export default function WalletBalances() {
   const [solanaAddress, setSolanaAddress] = useState<string | null>(null)
+  const [solanaWallet, setSolanaWallet] = useState<SolanaWalletAdapter | null>(null)
+  const [solanaConnection, setSolanaConnection] = useState<Connection | null>(null)
+  const [solanaBalances, setSolanaBalances] = useState<SplDustToken[]>([])
+  const [allbridgeSupported, setAllbridgeSupported] = useState<boolean | null>(null)
   const [starknetBalances, setStarknetBalances] = useState<Balances>({})
   const [stellarBalances, setStellarBalances] = useState<StellarBalance[]>([])
   const [starknetAddress, setStarknetAddress] = useState<string | null>(null)
@@ -527,6 +540,19 @@ export default function WalletBalances() {
   const [stellarAccountError, setStellarAccountError] = useState<'not_found' | 'rate_limit' | 'maintenance' | null>(null)
   const [stellarGeneralError, setStellarGeneralError] = useState<string | null>(null)
   const [isLoadingFriendbot, setIsLoadingFriendbot] = useState(false)
+  const [tokenPrices, setTokenPrices] = useState<Record<string, number>>({})
+  const [isFetchingPrices, setIsFetchingPrices] = useState(false)
+
+  const fetchPrices = useCallback(async () => {
+    setIsFetchingPrices(true)
+    try {
+      const symbols = ['ETH', 'STRK', 'USDC', 'USDT', 'DAI', 'WBTC', 'XLM']
+      const prices = await getTokenPrices(symbols)
+      setTokenPrices(prices)
+    } finally {
+      setIsFetchingPrices(false)
+    }
+  }, [])
 
   const [minThreshold, setMinThreshold] = useState<number>(() => {
     if (typeof window === 'undefined') return DEFAULT_MIN_THRESHOLD
@@ -567,6 +593,7 @@ export default function WalletBalances() {
         balancesObj[token.symbol] = Number(balance.toString()) / 10 ** token.decimals
       }
       setStarknetBalances(balancesObj)
+      await fetchPrices()
     } catch (error) {
       console.error('Error connecting to Starknet:', error)
     }
@@ -586,6 +613,7 @@ export default function WalletBalances() {
               if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`)
               const data = await res.json()
               setStellarBalances(data.balances || [])
+              await fetchPrices()
               resolve()
             } catch (err) {
               console.error('Error in onWalletSelected:', err)
@@ -630,9 +658,10 @@ export default function WalletBalances() {
       process.env.NEXT_PUBLIC_SOLANA_RPC_URL ?? 'https://api.devnet.solana.com'
     const connection = new Connection(rpcUrl, 'finalized')
 
-    setSolanaAddress(solana.publicKey.toBase58())
-    setSolanaWallet(solana)
-    setSolanaConnection(connection)
+      setSolanaAddress(solana.publicKey.toBase58())
+      setSolanaWallet(solana)
+      setSolanaConnection(connection)
+      await fetchPrices()
 
     // Fetch SPL token accounts for this wallet via RPC
     // getParsedTokenAccountsByOwner returns all non-zero token accounts
@@ -678,24 +707,47 @@ export default function WalletBalances() {
   const calculateTotalSelectedValue = (): number => {
     let total = 0
     Object.entries(starknetBalances).forEach(([symbol, amount]) => {
-      if (selectedTokens.has(`starknet-${symbol}`)) total += amount
+      if (selectedTokens.has(`starknet-${symbol}`)) {
+        total += amount * (tokenPrices[symbol] || 1)
+      }
     })
     stellarBalances.forEach((bal, idx) => {
-      if (selectedTokens.has(`stellar-${idx}`)) total += parseFloat(bal.balance)
+      if (selectedTokens.has(`stellar-${idx}`)) {
+        const symbol = bal.asset_type === 'native' ? 'XLM' : bal.asset_code || 'Unknown'
+        total += parseFloat(bal.balance) * (tokenPrices[symbol] || 1)
+      }
     })
     return total
   }
 
   const allTokenRows = [
-    ...Object.entries(starknetBalances).map(([symbol, amount]) => ({
-      id: `starknet-${symbol}`, symbol, shortSymbol: symbol,
-      price: Number(amount.toFixed(4)), usdValue: amount, network: 'starknet' as const,
-    })),
+    ...Object.entries(starknetBalances).map(([symbol, amount]) => {
+      const price = tokenPrices[symbol] || 1
+      const usdValue = amount * price
+      return {
+        id: `starknet-${symbol}`,
+        symbol,
+        shortSymbol: symbol,
+        amount,
+        price: Number(usdValue.toFixed(4)),
+        usdValue,
+        network: 'starknet' as const,
+      }
+    }),
     ...stellarBalances.map((bal, idx) => {
       const symbol = bal.asset_type === 'native' ? 'XLM' : bal.asset_code || 'Unknown'
       const shortSymbol = bal.asset_type === 'native' ? 'XLM' : bal.asset_code || '??'
-      const price = Number(parseFloat(bal.balance).toFixed(4))
-      return { id: `stellar-${idx}`, symbol, shortSymbol, price, usdValue: price, network: 'stellar' as const }
+      const amount = parseFloat(bal.balance)
+      const price = tokenPrices[symbol] || 1
+      const usdValue = amount * price
+      return {
+        id: `stellar-${idx}`,
+        symbol,
+        shortSymbol,
+        price: Number(usdValue.toFixed(4)),
+        usdValue,
+        network: 'stellar' as const,
+      }
     }),
   ]
 
@@ -707,29 +759,32 @@ export default function WalletBalances() {
     Object.entries(starknetBalances).forEach(([symbol, amount]) => {
       const tokenId = `starknet-${symbol}`
       if (selectedTokens.has(tokenId)) {
-        dustBalances.push({ id: tokenId, asset: TOKENS[symbol]?.address || symbol, symbol, amount, usdValue: amount, network: 'starknet' })
+        const price = tokenPrices[symbol] || 1
+        dustBalances.push({ id: tokenId, asset: TOKENS[symbol]?.address || symbol, symbol, amount, usdValue: amount * price, network: 'starknet' })
       }
     })
     stellarBalances.forEach((bal, idx) => {
       const tokenId = `stellar-${idx}`
       if (selectedTokens.has(tokenId)) {
         const symbol = bal.asset_type === 'native' ? 'XLM' : bal.asset_code || 'Unknown'
-        dustBalances.push({ id: tokenId, asset: bal.asset_code || 'XLM', symbol, amount: parseFloat(bal.balance), usdValue: parseFloat(bal.balance), network: 'stellar' })
+        const price = tokenPrices[symbol] || 1
+        dustBalances.push({ id: tokenId, asset: bal.asset_code || 'XLM', symbol, amount: parseFloat(bal.balance), usdValue: parseFloat(bal.balance) * price, network: 'stellar' })
       }
     })
     solanaBalances.forEach((token, idx) => {
-  const tokenId = `solana-${idx}`
-  if (selectedTokens.has(tokenId)) {
-    dustBalances.push({
-      id: tokenId,
-      asset: token.mint,
-      symbol: token.symbol,
-      amount: Number(token.amountRaw) / 10 ** token.decimals,
-      usdValue: token.usdValue,
-      network: 'solana',
+      const tokenId = `solana-${idx}`
+      if (selectedTokens.has(tokenId)) {
+        const price = tokenPrices[token.symbol] || 1
+        dustBalances.push({
+          id: tokenId,
+          asset: token.mint,
+          symbol: token.symbol,
+          amount: Number(token.amountRaw) / 10 ** token.decimals,
+          usdValue: (Number(token.amountRaw) / 10 ** token.decimals) * price,
+          network: 'solana',
+        })
+      }
     })
-  }
-})
     return dustBalances
   }
 
@@ -802,6 +857,10 @@ export default function WalletBalances() {
       <div className="flex flex-wrap max-w-full gap-4">
         <Button className="w-auto bg-card text-foreground" onClick={fetchStarknetBalances}>Connect Starknet Wallet</Button>
         <Button className="w-auto bg-card text-foreground" onClick={fetchStellarBalances}>Connect Stellar Wallet</Button>
+        <Button className="w-auto bg-card text-foreground" onClick={fetchPrices} disabled={isFetchingPrices}>
+          {isFetchingPrices ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : <Settings2 className="w-4 h-4 mr-2" />}
+          Refresh Prices
+        </Button>
       </div>
 
       {hasBalances ? (
